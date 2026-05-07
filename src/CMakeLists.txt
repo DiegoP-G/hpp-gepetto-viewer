@@ -46,4 +46,11 @@ endif()
 if(USE_HPP_PYTHON)
     install_python_files("pyhpp_gepetto" __init__.py viewer.py)
     install_python_files("pyhpp_viser" __init__.py viewer.py)
+    install_python_files("pyhpp_rviz" __init__.py starter_rviz2.py viewer.py rviz_config_generator.py)
+
+    install(
+        DIRECTORY pyhpp_rviz/pkg/
+        DESTINATION share/hpp-gepetto-viewer/
+        USE_SOURCE_PERMISSIONS
+    )
 endif()

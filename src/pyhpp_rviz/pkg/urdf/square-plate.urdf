@@ -1,0 +1,17 @@
+<robot name="square-plate">
+  <link name="base_link">
+    <visual>
+      <material name="Blue">
+        <color rgba="0.1 0.1 0.9 1.0"/>
+      </material>
+      <geometry>
+        <box size="0.01 1 1"/>
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <box size="0.01 1 1"/>
+      </geometry>
+    </collision>
+  </link>
+</robot>

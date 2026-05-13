@@ -8,7 +8,15 @@ from pyhpp_rviz import start_rviz2
 from geometry_msgs.msg import TransformStamped
 from sensor_msgs.msg import JointState
 from tf2_ros import TransformBroadcaster
+        
+from moveit_msgs.msg import DisplayTrajectory, RobotState
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 import pyhpp.core as core
+
+
+from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point
+import time
 
 try:
     import hppfcl
@@ -151,6 +159,8 @@ class RVizVisualizer(BaseVisualizer):
         self._spin_thread = None
 
     def initViewer(self, config_generator=None, robot=None):
+        self.display_pub = None   # ← Ajoute ça
+        self.current_q = None
         self.model = robot.model()
         self.data = self.model.createData()
         if callable(robot.geomModel):
@@ -199,21 +209,137 @@ class RVizVisualizer(BaseVisualizer):
         if q is not None and self.joint_state_publisher is not None:
             self._publish_scene(q)
 
-    def displayPath(self, path: core.bindings.Path, dt=0.07):
 
-        threading.Thread(
-            target=self._display_path_thread, args=(path, dt), daemon=True
-        ).start()
-        pass
+
+    # def displayPath(self, path: core.bindings.Path, dt: float = 0.05, 
+    #             topic_name: str = "display_planned_path"):
+    #     """
+    #     Affiche un path HPP dans RViz avec DisplayTrajectory (style MoveIt)
+    #     """
+    #     # Création du publisher la première fois
+    #     if not hasattr(self, 'display_pub') or self.display_pub is None:
+    #         self.display_pub = self.joint_state_publisher.create_publisher(  # ← Important
+    #             DisplayTrajectory, 
+    #             topic_name, 
+    #             10
+    #         )
+
+    #     display = DisplayTrajectory()
+        
+    #     # État initial du robot
+    #     if self.current_q is not None:
+    #         display.trajectory_start = self._create_robot_state(self.current_q)
+
+    #     traj = JointTrajectory()
+        
+    #     # Récupération des joint names (on prend le premier namespace)
+    #     if self.joint_state_map:
+    #         main_ns = next(iter(self.joint_state_map.keys()))
+    #         traj.joint_names = [name for name, _ in self.joint_state_map[main_ns]]
+    #     else:
+    #         traj.joint_names = [self.model.names[i] for i in range(1, self.model.njoints)]
+
+    #     t = 0.0
+    #     step = 0
+    #     while t <= path.length() + 1e-6:
+    #         q_eval = path.eval(t)[0]
+    #         q_vec = np.asarray(q_eval).reshape(-1)
+
+    #         point = JointTrajectoryPoint()
+    #         point.positions = [float(x) for x in q_vec]
+    #         point.time_from_start = rclpy.duration.Duration(seconds=t).to_msg()
+            
+    #         traj.points.append(point)
+    #         t += dt
+    #         step += 1
+
+    #     display.trajectory.append(traj)
+    #     self.display_pub.publish(display)
+        
+    #     print(f"✅ Path publié ({len(traj.points)} points) sur /{topic_name}")
+
+
+    def displayPath(self, path: core.bindings.Path, dt: float = 0.03, 
+                topic_name: str = "hpp_path"):
+        """
+        Visualise le path HPP avec MarkerArray (beaucoup plus stable que moveit_msgs)
+        """
+        if not hasattr(self, 'marker_pub') or self.marker_pub is None:
+            self.marker_pub = self.joint_state_publisher.create_publisher(
+                MarkerArray, topic_name, 10
+            )
+
+        marker_array = MarkerArray()
+        
+        # Marker pour la ligne (le chemin)
+        line_marker = Marker()
+        line_marker.header.frame_id = "world"
+        line_marker.header.stamp = self.joint_state_publisher.get_clock().now().to_msg()
+        line_marker.ns = "hpp_path"
+        line_marker.id = 0
+        line_marker.type = Marker.LINE_STRIP
+        line_marker.action = Marker.ADD
+        line_marker.scale.x = 0.015  # épaisseur
+        line_marker.color.r = 0.0
+        line_marker.color.g = 0.7
+        line_marker.color.b = 1.0
+        line_marker.color.a = 0.9
+
+        # Marker pour les points (optionnel)
+        points_marker = Marker()
+        points_marker.header.frame_id = "world"
+        points_marker.header.stamp = line_marker.header.stamp
+        points_marker.ns = "hpp_path_points"
+        points_marker.id = 1
+        points_marker.type = Marker.SPHERE_LIST
+        points_marker.action = Marker.ADD
+        points_marker.scale.x = 0.025
+        points_marker.scale.y = 0.025
+        points_marker.scale.z = 0.025
+        points_marker.color.r = 1.0
+        points_marker.color.g = 0.5
+        points_marker.color.b = 0.0
+        points_marker.color.a = 0.8
+
+        t = 0.0
+        while t <= path.length() + 1e-6:
+            q = path.eval(t)[0]
+            q_vec = np.asarray(q).reshape(-1)
+
+            # Récupérer la position d'un point de référence (ex: gripper ou base)
+            pin.forwardKinematics(self.model, self.data, q_vec)
+            
+            # On prend la position du dernier link (à adapter selon ton robot)
+            end_effector_pos = self.data.oMf[self.model.getFrameId("panda_hand")] if "panda" in str(self.model) else self.data.oMf[-1]
+            
+            p = Point()
+            p.x = end_effector_pos.translation[0]
+            p.y = end_effector_pos.translation[1]
+            p.z = end_effector_pos.translation[2]
+            
+            line_marker.points.append(p)
+            points_marker.points.append(p)
+            
+            t += dt
+
+        marker_array.markers.append(line_marker)
+        marker_array.markers.append(points_marker)
+        
+        self.marker_pub.publish(marker_array)
+        print(f"✅ Path visualisé avec MarkerArray ({len(line_marker.points)} points)")
+
+    # def displayPath(self, path: core.bindings.Path, dt=0.07):
+
+    #     threading.Thread(
+    #         target=self._display_path_thread, args=(path, dt), daemon=True
+    #     ).start()
+    #     pass
 
     def _display_path_thread(self, path: core.bindings.Path, dt):
         t = 0.0
-
         while t <= path.length():
             q: tuple = path.eval(t)
             q = q[0]
-            if t == 0.0:
-                print(f"Initial configuration: {q}")
             self._publish_scene(q)
             t += dt
 
@@ -269,7 +395,6 @@ class RVizVisualizer(BaseVisualizer):
                 namespace, joint_name = "", name
 
             if joint.nq == 1:
-                # Joint classique → /joint_states
                 self.joint_state_map.setdefault(namespace, []).append(
                     (joint_name, joint.idx_q)
                 )

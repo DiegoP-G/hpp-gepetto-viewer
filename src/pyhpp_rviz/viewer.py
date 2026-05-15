@@ -1,402 +1,331 @@
+import os
 import threading
-
+import time
 import numpy as np
 import pinocchio as pin
-from pinocchio.visualize import BaseVisualizer
-from attrs import field
-from pyhpp_rviz import start_rviz2
-from geometry_msgs.msg import TransformStamped, PoseStamped
-from nav_msgs.msg import Path
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
+from dataclasses import dataclass, field
+
 from sensor_msgs.msg import JointState
-from tf2_ros import TransformBroadcaster
-        
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-import pyhpp.core as core
-
-
+from geometry_msgs.msg import TransformStamped
 from visualization_msgs.msg import Marker, MarkerArray
+from nav_msgs.msg import Path
+from geometry_msgs.msg import PoseStamped
 from geometry_msgs.msg import Point
-import time
+from tf2_ros import TransformBroadcaster
+
+from pinocchio.visualize import BaseVisualizer
+import pyhpp.core as core
 
 try:
     import hppfcl
-
-    WITH_HPP_FCL_BINDINGS = True
 except ImportError:
-    WITH_HPP_FCL_BINDINGS = False
+    hppfcl = None
 
 
-from rclpy.executors import MultiThreadedExecutor
-from rclpy.node import Node
-
-import rclpy
-
-
-class OdometryPublisher(Node):
-    """Publish odometry transforms on /odometry  in oder to show the path loaded. maybe will be replaces by simple circular markers in the future"""
-
-    def __init__(self):
-        super().__init__("pinnochio_odometry_publisher")
-        self.publisher = self.create_publisher(TransformStamped, "odometry", 10)
-
-    def publish(self, parent_frame, child_frame, xyz, quat_xyzw):
-        msg = TransformStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = parent_frame
-        msg.child_frame_id = child_frame
-        msg.transform.translation.x = xyz[0]
-        msg.transform.translation.y = xyz[1]
-        msg.transform.translation.z = xyz[2]
-        msg.transform.rotation.x = quat_xyzw[0]
-        msg.transform.rotation.y = quat_xyzw[1]
-        msg.transform.rotation.z = quat_xyzw[2]
-        msg.transform.rotation.w = quat_xyzw[3]
-        self.publisher.publish(msg)
-
-
-class JointStatePublisher(Node):
-    """Publish posotions of all joints on /joint_states (or /<namespace>/joint_states)"""
-
-    def __init__(self):
-        super().__init__("pinnochio_joint_state_publisher")
-        self.publishers_map = {}
-        self.last_states = {}
-        self.timer = self.create_timer(0.02, self._republish)  # 50 Hz
-
-    def _republish(self):
-        for topic, (publisher, names, positions) in self.last_states.items():
-            msg = JointState()
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.name = names
-            msg.position = positions
-            publisher.publish(msg)
-
-    def _get_publisher(self, namespace):
-        ns = namespace.strip("/")
-        topic = f"{ns}/joint_states" if ns else "joint_states"
-        if topic not in self.publishers_map:
-            self.publishers_map[topic] = self.create_publisher(JointState, topic, 10)
-        return self.publishers_map[topic]
-
-    def publish(self, namespace, names, positions):
-        ns = namespace.strip("/")
-        topic = f"{ns}/joint_states" if ns else "joint_states"
-        self._get_publisher(namespace)  # ensure created
-        self.last_states[topic] = (
-            self.publishers_map[topic],
-            list(names),
-            list(positions),
-        )
-
-
-class TFBroadcasterNode(Node):
-    """
-    Publish freeflyer transforms on /tf via TransformBroadcaster.
-    For each freeflyer joint, broadcast a TF from parent (ex:"world") to  Child frame (ex:"<namespace>/base_link").
-    """
-
-    def __init__(self):
-        super().__init__("pinnochio_tf_broadcaster")
-        # TransformBroadcaster publie directement sur /tf (type TFMessage)
-        self.broadcaster = TransformBroadcaster(self)
-        # clé: child_frame_id → dict avec parent, xyz, quat
-        self.last_transforms = {}
-        self.timer = self.create_timer(0.02, self._republish)  # 50 Hz
-
-    def _republish(self):
-        if not self.last_transforms:
-            return
-        transforms = []
-        now = self.get_clock().now().to_msg()
-        for child_frame, data in self.last_transforms.items():
-            t = TransformStamped()
-            t.header.stamp = now
-            t.header.frame_id = data["parent_frame"]  # ex: "world"
-            t.child_frame_id = child_frame  # ex: "box/base_link"
-            t.transform.translation.x = data["xyz"][0]
-            t.transform.translation.y = data["xyz"][1]
-            t.transform.translation.z = data["xyz"][2]
-            # Ordre Pinocchio freeflyer: [x, y, z, qx, qy, qz, qw]
-            t.transform.rotation.x = data["quat"][0]
-            t.transform.rotation.y = data["quat"][1]
-            t.transform.rotation.z = data["quat"][2]
-            t.transform.rotation.w = data["quat"][3]
-            transforms.append(t)
-        self.broadcaster.sendTransform(transforms)
-
-    def publish(self, parent_frame, child_frame, xyz, quat_xyzw):
-        """
-        Mettre à jour le transform pour child_frame.
-        xyz    : [x, y, z]
-        quat   : [qx, qy, qz, qw]  (ordre Pinocchio)
-        """
-        self.last_transforms[child_frame] = {
-            "parent_frame": parent_frame,
-            "xyz": list(xyz),
-            "quat": list(quat_xyzw),
-        }
+@dataclass
+class _PathPlayerState:
+    current: object = None
+    paths: dict = field(default_factory=dict)
+    counter: int = 0
+    playing: bool = False
+    thread: threading.Thread = None
+    speed: float = 1.0
+    fps: int = 60
 
 
 class RVizVisualizer(BaseVisualizer):
-    """Pinocchio RViz2 visualizer (ROS 2)"""
+    """
+    Visualiseur Pinocchio pour RViz utilisant UNIQUEMENT MarkerArray
+    (sans RobotModel / sans URDF)
+    """
 
     def __init__(self):
-        self.robot = None
-        self.model: pin.Model = pin.Model()
-        self.data: pin.Data = pin.Data()
-        self.geom_model: pin.GeometryModel = None
-        self.visual_model: pin.GeometryModel = None
-        self.visual_data: pin.GeometryData = None
-        self.publisher_frame_id = "world"
+        super().__init__()
+        self.model = None
+        self.data = None
+        self.visual_model = None
 
-        self.joint_state_publisher = None
-        self.joint_state_map = {}
-
-        self.tf_broadcaster = None
-        self.freeflyer_map = {}
-
-        self._executor = None
-        self._spin_thread = None
-
-    def initViewer(self, config_generator=None, robot=None):
-        self.display_pub = None   # ← Ajoute ça
+        self._path_player = _PathPlayerState()
         self.current_q = None
+
+        # ROS 2
+        self.node = None
+        self.marker_pub = None
+        self.tf_broadcaster = None
+        self.executor = None
+        self.spin_thread = None
+
+        self._robot_markers = None
+        self._initialized = False
+
+    def initViewer(self, robot=None, node_name="hpp_rviz_marker"):
+        if robot is None:
+            raise ValueError("robot is required")
+
+        self._robot = robot
         self.model = robot.model()
         self.data = self.model.createData()
-        if callable(robot.geomModel):
-            self.geom_model = robot.geomModel()
-        if callable(robot.visualModel):
+
+        if hasattr(robot, 'visualModel') and callable(robot.visualModel):
             self.visual_model = robot.visualModel()
-        if self.visual_model is not None:
             self.visual_data = self.visual_model.createData()
 
-        self.robot = robot
-
-        if config_generator is None:
-            raise ValueError(
-                "Config generator is required for initializing RVizVisualizer"
-            )
-
-        config_generator.generate_config(config_path="/tmp/test_config.rviz")
-        config_generator.write_nodes_yaml("/tmp/nodes.yaml")
-        start_rviz2(
-            RVIZ_CONFIG_PATH="/tmp/test_config.rviz", NODES_YAML_PATH="/tmp/nodes.yaml"
-        )
-
+        # ROS 2
         if not rclpy.ok():
             rclpy.init()
+        
+        self.node = Node(node_name)
+        self.PathMarker_pub = self.node.create_publisher(Path, "hpp_path", 10)
+        self.ModelMarker_pub = self.node.create_publisher(MarkerArray, "hpp_robot", 10)
+        self.tf_broadcaster = TransformBroadcaster(self.node)
 
-        self.joint_state_publisher = JointStatePublisher()
-        self.tf_broadcaster = TFBroadcasterNode()
+        self.executor = MultiThreadedExecutor()
+        self.executor.add_node(self.node)
 
-        self._build_map_for_publisher()
+        self.spin_thread = threading.Thread(target=self.executor.spin, daemon=True)
+        self.spin_thread.start()
 
-        self._executor = MultiThreadedExecutor()
-        self._executor.add_node(self.joint_state_publisher)
-        self._executor.add_node(self.tf_broadcaster)
-
-        self._spin_thread = threading.Thread(target=self._executor.spin, daemon=True)
-        self._spin_thread.start()
-
-    # ====================== Main display function ======================
+        self._initialized = True
+        print(f"✅ RVizVisualizer (Marker Only) initialized on node '{node_name}'")
 
     def __call__(self, q):
         self.display(q)
 
     def display(self, q=None):
-        if q is not None:
-            pin.forwardKinematics(self.model, self.data, q)
-        if q is not None and self.joint_state_publisher is not None:
-            self._publish_scene(q)
-
-
-
-    # def displayPath(self, path: core.bindings.Path, dt: float = 0.05, 
-    #             topic_name: str = "display_planned_path"):
-    #     """
-    #     Affiche un path HPP dans RViz avec DisplayTrajectory (style MoveIt)
-    #     """
-    #     # Création du publisher la première fois
-    #     if not hasattr(self, 'display_pub') or self.display_pub is None:
-    #         self.display_pub = self.joint_state_publisher.create_publisher(  # ← Important
-    #             DisplayTrajectory, 
-    #             topic_name, 
-    #             10
-    #         )
-
-    #     display = DisplayTrajectory()
-        
-    #     # État initial du robot
-    #     if self.current_q is not None:
-    #         display.trajectory_start = self._create_robot_state(self.current_q)
-
-    #     traj = JointTrajectory()
-        
-    #     # Récupération des joint names (on prend le premier namespace)
-    #     if self.joint_state_map:
-    #         main_ns = next(iter(self.joint_state_map.keys()))
-    #         traj.joint_names = [name for name, _ in self.joint_state_map[main_ns]]
-    #     else:
-    #         traj.joint_names = [self.model.names[i] for i in range(1, self.model.njoints)]
-
-    #     t = 0.0
-    #     step = 0
-    #     while t <= path.length() + 1e-6:
-    #         q_eval = path.eval(t)[0]
-    #         q_vec = np.asarray(q_eval).reshape(-1)
-
-    #         point = JointTrajectoryPoint()
-    #         point.positions = [float(x) for x in q_vec]
-    #         point.time_from_start = rclpy.duration.Duration(seconds=t).to_msg()
-            
-    #         traj.points.append(point)
-    #         t += dt
-    #         step += 1
-
-    #     display.trajectory.append(traj)
-    #     self.display_pub.publish(display)
-        
-    #     print(f"✅ Path publié ({len(traj.points)} points) sur /{topic_name}")
-
-
-    def displayPath(self, path: core.bindings.Path, dt: float = 0.03, 
-                topic_name: str = "hpp_path", origin = "world", target_frame = "path_point"):
-        """
-        Visualise le path HPP avec MarkerArray )
-        """
-        if not hasattr(self, 'marker_pub') or self.marker_pub is None:
-            self.marker_pub = self.joint_state_publisher.create_publisher(
-                MarkerArray, topic_name, 10
-            )
-
-        marker_array = MarkerArray()
-        
-        # Marker pour la ligne (le chemin)
-        line_marker = Marker()
-        line_marker.header.frame_id = origin
-        line_marker.header.stamp = self.joint_state_publisher.get_clock().now().to_msg()
-        line_marker.ns = "hpp_path"
-        line_marker.id = 0
-        line_marker.type = Marker.LINE_STRIP
-        line_marker.action = Marker.ADD
-        line_marker.scale.x = 0.015  # épaisseur
-        line_marker.color.r = 0.0
-        line_marker.color.g = 0.7
-        line_marker.color.b = 1.0
-        line_marker.color.a = 0.9
-
-        # Marker pour les points (optionnel)
-        points_marker = Marker()
-        points_marker.header.frame_id = origin
-        points_marker.header.stamp = line_marker.header.stamp
-        points_marker.ns = "hpp_path_points"
-        points_marker.id = 1
-        points_marker.type = Marker.SPHERE_LIST
-        points_marker.action = Marker.ADD
-        points_marker.scale.x = 0.025
-        points_marker.scale.y = 0.025
-        points_marker.scale.z = 0.025
-        points_marker.color.r = 1.0
-        points_marker.color.g = 0.5
-        points_marker.color.b = 0.0
-        points_marker.color.a = 0.8
-
-        t = 0.0
-        while t <= path.length() + 1e-6:
-            q = path.eval(t)[0]
-            q_vec = np.asarray(q).reshape(-1)
-
-            # Récupérer la position d'un point de référence (ex: gripper ou base)
-            pin.forwardKinematics(self.model, self.data, q_vec)
-            pin.updateFramePlacements(self.model, self.data)
-
-            # On prend la position du dernier link (à adapter selon ton robot)
-            if target_frame not in [frame.name for frame in self.model.frames]:
-                print(f"⚠️ Frame '{target_frame}' not found in model. Available frames: {list(frame.name for frame in self.model.frames)}")
-                return
-            
-            end_effector_pos = self.data.oMf[self.model.getFrameId(target_frame)]
-  
-            p = Point()
-            p.x = end_effector_pos.translation[0]
-            p.y = end_effector_pos.translation[1]
-            p.z = end_effector_pos.translation[2]
-            
-            line_marker.points.append(p)
-            points_marker.points.append(p)
-            
-            t += dt
-
-        marker_array.markers.append(line_marker)
-        marker_array.markers.append(points_marker)
-        
-        self.marker_pub.publish(marker_array)
-        print(f"✅ Path visualisé avec MarkerArray ({len(line_marker.points)} points)")
-
-    def displayPathNav(self, path: core.bindings.Path, dt: float = 0.03,
-                    topic_name: str = "hpp_path", origin = "world", target_frame = "path_point"):
-        """
-        Visualise le path HPP avec nav_msgs/Path (RViz Path display).
-        """
-        if not hasattr(self, "path_pub") or self.path_pub is None:
-            self.path_pub = self.joint_state_publisher.create_publisher(
-                Path, topic_name, 10
-            )
-
-        if target_frame not in [frame.name for frame in self.model.frames]:
-            print(f"⚠️ Frame '{target_frame}' not found in model. Available frames: {list(frame.name for frame in self.model.frames)}")
+        if q is None:
             return
-            
+        self.current_q = np.asarray(q).reshape(-1)
+        pin.forwardKinematics(self.model, self.data, self.current_q)
 
-        now = self.joint_state_publisher.get_clock().now().to_msg()
-        msg = Path()
-        msg.header.frame_id = origin
-        msg.header.stamp = now
+        if self.visual_model is not None:
+            pin.updateGeometryPlacements(
+                self.model, self.data, self.visual_model, self.visual_data
+            )
+        
+        self._publish_robot_as_markers()
 
+    def _publish_robot_as_markers(self):
+        """Affiche le robot complet avec les visuels Pinocchio si possible."""
+        if self.ModelMarker_pub is None:
+            return
+
+        ma = MarkerArray()
+
+        if self.visual_model is not None and self.visual_data is not None:
+            for geom_id, geom_obj in enumerate(self.visual_model.geometryObjects):
+                marker = Marker()
+                marker.header.frame_id = "world"
+                marker.header.stamp = self.node.get_clock().now().to_msg()
+                marker.ns = geom_obj.name
+                marker.id = geom_id
+                marker.action = Marker.ADD
+
+                M = self.visual_data.oMg[geom_id]
+                marker.pose.position.x = float(M.translation[0])
+                marker.pose.position.y = float(M.translation[1])
+                marker.pose.position.z = float(M.translation[2])
+                quat = pin.Quaternion(M.rotation)
+                marker.pose.orientation.x = quat.x
+                marker.pose.orientation.y = quat.y
+                marker.pose.orientation.z = quat.z
+                marker.pose.orientation.w = quat.w
+
+                if hppfcl is not None and hasattr(geom_obj, "geometry"):
+                    geom = geom_obj.geometry
+                    if isinstance(geom, hppfcl.Box):
+                        marker.type = Marker.CUBE
+                        marker.scale.x = float(geom.halfSide[0] * 2.0)
+                        marker.scale.y = float(geom.halfSide[1] * 2.0)
+                        marker.scale.z = float(geom.halfSide[2] * 2.0)
+                    elif isinstance(geom, hppfcl.Sphere):
+                        marker.type = Marker.SPHERE
+                        d = float(geom.radius * 2.0)
+                        marker.scale.x = d
+                        marker.scale.y = d
+                        marker.scale.z = d
+                    elif isinstance(geom, hppfcl.Cylinder):
+                        marker.type = Marker.CYLINDER
+                        marker.scale.x = float(geom.radius * 2.0)
+                        marker.scale.y = float(geom.radius * 2.0)
+                        marker.scale.z = float(geom.halfLength * 2.0)
+                    elif isinstance(geom, hppfcl.Capsule):
+                        marker.type = Marker.CYLINDER
+                        marker.scale.x = float(geom.radius * 2.0)
+                        marker.scale.y = float(geom.radius * 2.0)
+                        marker.scale.z = float(geom.halfLength * 2.0)
+                    elif getattr(geom_obj, "meshPath", ""):
+                        marker.type = Marker.MESH_RESOURCE
+                        marker.mesh_resource = self._format_mesh_resource(
+                            geom_obj.meshPath
+                        )
+                        marker.scale.x = float(geom_obj.meshScale[0])
+                        marker.scale.y = float(geom_obj.meshScale[1])
+                        marker.scale.z = float(geom_obj.meshScale[2])
+                    else:
+                        marker.type = Marker.CUBE
+                        marker.scale.x = 0.05
+                        marker.scale.y = 0.05
+                        marker.scale.z = 0.05
+                elif getattr(geom_obj, "meshPath", ""):
+                    marker.type = Marker.MESH_RESOURCE
+                    marker.mesh_resource = self._format_mesh_resource(
+                        geom_obj.meshPath
+                    )
+                    marker.scale.x = float(geom_obj.meshScale[0])
+                    marker.scale.y = float(geom_obj.meshScale[1])
+                    marker.scale.z = float(geom_obj.meshScale[2])
+                else:
+                    marker.type = Marker.CUBE
+                    marker.scale.x = 0.05
+                    marker.scale.y = 0.05
+                    marker.scale.z = 0.05
+
+                if getattr(geom_obj, "overrideMaterial", False):
+                    color = geom_obj.meshColor
+                    marker.color.r = float(color[0])
+                    marker.color.g = float(color[1])
+                    marker.color.b = float(color[2])
+                    marker.color.a = float(color[3])
+                else:
+                    marker.mesh_use_embedded_materials = True
+                    marker.color.r = 0.8
+                    marker.color.g = 0.8
+                    marker.color.b = 0.8
+                    marker.color.a = 1.0
+
+                ma.markers.append(marker)
+        else:
+            for i in range(1, self.model.njoints):
+                frame_id = self.model.getFrameId(self.model.names[i])
+                oMf = self.data.oMf[frame_id]
+
+                marker = Marker()
+                marker.header.frame_id = "world"
+                marker.header.stamp = self.node.get_clock().now().to_msg()
+                marker.ns = self.model.names[i]
+                marker.id = i
+                marker.action = Marker.ADD
+
+                marker.pose.position.x = oMf.translation[0]
+                marker.pose.position.y = oMf.translation[1]
+                marker.pose.position.z = oMf.translation[2]
+                quat = pin.Quaternion(oMf.rotation)
+                marker.pose.orientation.x = quat.x
+                marker.pose.orientation.y = quat.y
+                marker.pose.orientation.z = quat.z
+                marker.pose.orientation.w = quat.w
+
+                marker.type = Marker.CUBE
+                marker.scale.x = 0.08
+                marker.scale.y = 0.08
+                marker.scale.z = 0.08
+ 
+                marker.color.r = 0.2
+                marker.color.g = 0.5
+                marker.color.b = 0.9
+                marker.color.a = 0.85
+                ma.markers.append(marker)
+
+        self.ModelMarker_pub.publish(ma)
+
+    def _format_mesh_resource(self, mesh_path: str) -> str:
+        """Return a RViz-compatible mesh resource URI."""
+        if not mesh_path:
+            return mesh_path
+        if mesh_path.startswith("package://"):
+            return mesh_path
+        if mesh_path.startswith("file://"):
+            return mesh_path
+        if os.path.isabs(mesh_path):
+            return "file://" + mesh_path
+        return mesh_path
+
+
+    # ====================== Path ======================
+
+    def loadPath(self, path, name=None):
+        if name is None:
+            name = f"Path {self._path_player.counter}"
+            self._path_player.counter += 1
+
+        self._path_player.paths[name] = path
+        self._path_player.current = path
+        print(f"✅ Path '{name}' loaded ({path.length():.2f} s)")
+
+        q, _ = path.eval(0.0)
+        self.display(q)
+
+    def playPath(self, speed=1.0, fps=60):
+        if self._path_player.current is None:
+            print("Aucun path chargé")
+            return
+
+        self._path_player.playing = True
+        self._path_player.speed = speed
+        self._path_player.fps = fps
+
+        def animate():
+            path = self._path_player.current
+            t = 0.0
+            dt = 1.0 / fps
+
+            while self._path_player.playing and t <= path.length():
+                start = time.time()
+                q, success = path.eval(t)
+                if success:
+                    self.display(q)
+                t += dt * speed
+                time.sleep(max(0, dt - (time.time() - start)))
+
+            self._path_player.playing = False
+            print("Playback terminé")
+
+        self._path_player.thread = threading.Thread(target=animate, daemon=True)
+        self._path_player.thread.start()
+
+    def displayPath(self, path: core.bindings.Path, dt=0.04, color=(0.0, 0.8, 1.0, 0.9), origin_frame="panda_link0"):
+        """Affiche uniquement le chemin en ligne (end-effector)"""
+        path_msg = Path()
+        path_msg.header.frame_id = "world"
+        path_msg.header.stamp = self.node.get_clock().now().to_msg()
+
+        frame_names = {frame.name for frame in self.model.frames}
+        if origin_frame not in frame_names:
+            raise ValueError(
+                f"Frame '{origin_frame}' not found in model. "
+                f"Available frames: {sorted(frame_names)}"
+            )
+
+        frame_id = self.model.getFrameId(origin_frame)
         t = 0.0
         while t <= path.length() + 1e-6:
-            q = path.eval(t)[0]
-            q_vec = np.asarray(q).reshape(-1)
-
-            pin.forwardKinematics(self.model, self.data, q_vec)
+            q = np.asarray(path.eval(t)[0]).reshape(-1)
+            pin.forwardKinematics(self.model, self.data, q)
             pin.updateFramePlacements(self.model, self.data)
 
-            end_effector_pos = self.data.oMf[self.model.getFrameId(target_frame)]
-            quat_xyzw = pin.Quaternion(end_effector_pos.rotation)
+            # Position de l'end-effector (change selon ton robot)
+            pos = self.data.oMf[frame_id].translation
 
             pose = PoseStamped()
-            pose.header.frame_id = origin
-            pose.header.stamp = now
-            pose.pose.position.x = end_effector_pos.translation[0]
-            pose.pose.position.y = end_effector_pos.translation[1]
-            pose.pose.position.z = end_effector_pos.translation[2]
-            pose.pose.orientation.x = quat_xyzw.x
-            pose.pose.orientation.y = quat_xyzw.y
-            pose.pose.orientation.z = quat_xyzw.z
-            pose.pose.orientation.w = quat_xyzw.w
-            msg.poses.append(pose)
-
+            pose.header = path_msg.header
+            pose.pose.position.x = float(pos[0])
+            pose.pose.position.y = float(pos[1])
+            pose.pose.position.z = float(pos[2])
+            pose.pose.orientation.w = 1.0
+            path_msg.poses.append(pose)
             t += dt
 
-        self.path_pub.publish(msg)
-        print(f"✅ Path publié (nav_msgs/Path, {len(msg.poses)} poses)")
+        if self.PathMarker_pub is not None:
+            self.PathMarker_pub.publish(path_msg)
+        print(f"Path affiché ({len(path_msg.poses)} points)")
 
-    def startPathDisplay(self, path: core.bindings.Path, dt=0.07):
-
-        threading.Thread(
-            target=self._display_path_thread, args=(path, dt), daemon=True
-        ).start()
-        pass
-
-    def _display_path_thread(self, path: core.bindings.Path, dt):
-        t = 0.0
-        while t <= path.length():
-            q: tuple = path.eval(t)
-            q = q[0]
-            self._publish_scene(q)
-            t += dt
-
-    # ====================== Méthodes abstraites ======================
+    def close(self):
+        if self.executor:
+            self.executor.shutdown()
+        print("RVizVisualizer fermé")
 
     def captureImage(self, w=None, h=None):
         raise NotImplementedError
@@ -431,91 +360,4 @@ class RVizVisualizer(BaseVisualizer):
     def displayVisuals(self, visibility: bool):
         pass
 
-    # ====================== Mapping joints ======================
-
-    def _build_map_for_publisher(self):
-        self.joint_state_map = {}
-        self.freeflyer_map = {}
-
-        for joint_id in range(1, self.model.njoints):
-            name = self.model.names[joint_id]
-            joint: pin.JointModel = self.model.joints[joint_id]
-            shortname = joint.shortname()
-
-            if "/" in name:
-                namespace, joint_name = name.split("/", 1)
-            else:
-                namespace, joint_name = "", name
-
-            if joint.nq == 1:
-                self.joint_state_map.setdefault(namespace, []).append(
-                    (joint_name, joint.idx_q)
-                )
-
-            elif joint.nq == 7:
-                # Freeflyer → TF broadcast world → <namespace>/base_link
-                # Le root link est le 1er body attaché à ce joint
-                root_link = self._get_root_link_for_joint(joint_id)
-                child_frame = f"{namespace}/{root_link}" if namespace else root_link
-                self.freeflyer_map.setdefault(namespace, []).append(
-                    (joint_name, joint.idx_q, child_frame)
-                )
-            else:
-                raise ValueError(
-                    f"Not Yet Supported joint type for joint '{name}' with nq={joint.nq} of type {shortname}"
-                )
-
-            print(
-                f"  joint '{name}' | nq={joint.nq} | type={shortname} | idx_q={joint.idx_q}"
-            )
-
-        print("joint_state_map :", self.joint_state_map)
-        print("freeflyer_map   :", self.freeflyer_map)
-
-    def _get_root_link_for_joint(self, joint_id: int) -> str:
-        """Retourne le nom du premier frame (body) attaché à ce joint."""
-        for frame in self.model.frames:
-            frame: pin.Frame
-            if frame.parentJoint == joint_id and frame.type == pin.FrameType.BODY:
-                # Enlever le namespace (ex: "box/base_link" → "base_link")
-                fname = frame.name
-                if "/" in fname:
-                    fname = fname.split("/", 1)[1]
-                return fname
-        # Fallback: utiliser le nom du joint sans namespace
-        name = self.model.names[joint_id]
-        return name.split("/", 1)[1] if "/" in name else name
-
-    # ====================== Publication ======================
-
-    def _publish_scene(self, q):
-        q_vec = np.asarray(q).reshape(-1)
-        # 1. Joints classiques → /panda/joint_states, etc.
-        for namespace, joints in self.joint_state_map.items():
-            names = []
-            positions = []
-            for joint_name, idx_q in joints:
-                names.append(joint_name)
-                positions.append(float(q_vec[idx_q]))
-            if names:
-                print(
-                    f"Publishing JointState for namespace '{namespace}': {list(zip(names, positions))}"
-                )
-                self.joint_state_publisher.publish(namespace, names, positions)
-
-        # 2. Freeflyers → /tf via TransformBroadcaster
-        for namespace, joints in self.freeflyer_map.items():
-            for joint_name, idx_q, child_frame in joints:
-                # Pinocchio freeflyer layout: [x, y, z, qx, qy, qz, qw]
-                xyz = q_vec[idx_q : idx_q + 3]
-                quat = q_vec[idx_q + 3 : idx_q + 7]  # qx qy qz qw
-
-                print(
-                    f"Publishing TF: world → '{child_frame}' | xyz={list(xyz)} quat={list(quat)}"
-                )
-                self.tf_broadcaster.publish(
-                    parent_frame="world",
-                    child_frame=child_frame,
-                    xyz=xyz,
-                    quat_xyzw=quat,
-                )
+   

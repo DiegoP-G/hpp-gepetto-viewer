@@ -5,11 +5,11 @@ import pinocchio as pin
 from pinocchio.visualize import BaseVisualizer
 from attrs import field
 from pyhpp_rviz import start_rviz2
-from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import TransformStamped, PoseStamped
+from nav_msgs.msg import Path
 from sensor_msgs.msg import JointState
 from tf2_ros import TransformBroadcaster
         
-from moveit_msgs.msg import DisplayTrajectory, RobotState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 import pyhpp.core as core
 
@@ -260,9 +260,9 @@ class RVizVisualizer(BaseVisualizer):
 
 
     def displayPath(self, path: core.bindings.Path, dt: float = 0.03, 
-                topic_name: str = "hpp_path"):
+                topic_name: str = "hpp_path", origin = "world", target_frame = "path_point"):
         """
-        Visualise le path HPP avec MarkerArray (beaucoup plus stable que moveit_msgs)
+        Visualise le path HPP avec MarkerArray )
         """
         if not hasattr(self, 'marker_pub') or self.marker_pub is None:
             self.marker_pub = self.joint_state_publisher.create_publisher(
@@ -273,7 +273,7 @@ class RVizVisualizer(BaseVisualizer):
         
         # Marker pour la ligne (le chemin)
         line_marker = Marker()
-        line_marker.header.frame_id = "world"
+        line_marker.header.frame_id = origin
         line_marker.header.stamp = self.joint_state_publisher.get_clock().now().to_msg()
         line_marker.ns = "hpp_path"
         line_marker.id = 0
@@ -287,7 +287,7 @@ class RVizVisualizer(BaseVisualizer):
 
         # Marker pour les points (optionnel)
         points_marker = Marker()
-        points_marker.header.frame_id = "world"
+        points_marker.header.frame_id = origin
         points_marker.header.stamp = line_marker.header.stamp
         points_marker.ns = "hpp_path_points"
         points_marker.id = 1
@@ -308,10 +308,15 @@ class RVizVisualizer(BaseVisualizer):
 
             # Récupérer la position d'un point de référence (ex: gripper ou base)
             pin.forwardKinematics(self.model, self.data, q_vec)
-            
+            pin.updateFramePlacements(self.model, self.data)
+
             # On prend la position du dernier link (à adapter selon ton robot)
-            end_effector_pos = self.data.oMf[self.model.getFrameId("panda_hand")] if "panda" in str(self.model) else self.data.oMf[-1]
+            if target_frame not in [frame.name for frame in self.model.frames]:
+                print(f"⚠️ Frame '{target_frame}' not found in model. Available frames: {list(frame.name for frame in self.model.frames)}")
+                return
             
+            end_effector_pos = self.data.oMf[self.model.getFrameId(target_frame)]
+  
             p = Point()
             p.x = end_effector_pos.translation[0]
             p.y = end_effector_pos.translation[1]
@@ -328,12 +333,60 @@ class RVizVisualizer(BaseVisualizer):
         self.marker_pub.publish(marker_array)
         print(f"✅ Path visualisé avec MarkerArray ({len(line_marker.points)} points)")
 
-    # def displayPath(self, path: core.bindings.Path, dt=0.07):
+    def displayPathNav(self, path: core.bindings.Path, dt: float = 0.03,
+                    topic_name: str = "hpp_path", origin = "world", target_frame = "path_point"):
+        """
+        Visualise le path HPP avec nav_msgs/Path (RViz Path display).
+        """
+        if not hasattr(self, "path_pub") or self.path_pub is None:
+            self.path_pub = self.joint_state_publisher.create_publisher(
+                Path, topic_name, 10
+            )
 
-    #     threading.Thread(
-    #         target=self._display_path_thread, args=(path, dt), daemon=True
-    #     ).start()
-    #     pass
+        if target_frame not in [frame.name for frame in self.model.frames]:
+            print(f"⚠️ Frame '{target_frame}' not found in model. Available frames: {list(frame.name for frame in self.model.frames)}")
+            return
+            
+
+        now = self.joint_state_publisher.get_clock().now().to_msg()
+        msg = Path()
+        msg.header.frame_id = origin
+        msg.header.stamp = now
+
+        t = 0.0
+        while t <= path.length() + 1e-6:
+            q = path.eval(t)[0]
+            q_vec = np.asarray(q).reshape(-1)
+
+            pin.forwardKinematics(self.model, self.data, q_vec)
+            pin.updateFramePlacements(self.model, self.data)
+
+            end_effector_pos = self.data.oMf[self.model.getFrameId(target_frame)]
+            quat_xyzw = pin.Quaternion(end_effector_pos.rotation)
+
+            pose = PoseStamped()
+            pose.header.frame_id = origin
+            pose.header.stamp = now
+            pose.pose.position.x = end_effector_pos.translation[0]
+            pose.pose.position.y = end_effector_pos.translation[1]
+            pose.pose.position.z = end_effector_pos.translation[2]
+            pose.pose.orientation.x = quat_xyzw.x
+            pose.pose.orientation.y = quat_xyzw.y
+            pose.pose.orientation.z = quat_xyzw.z
+            pose.pose.orientation.w = quat_xyzw.w
+            msg.poses.append(pose)
+
+            t += dt
+
+        self.path_pub.publish(msg)
+        print(f"✅ Path publié (nav_msgs/Path, {len(msg.poses)} poses)")
+
+    def startPathDisplay(self, path: core.bindings.Path, dt=0.07):
+
+        threading.Thread(
+            target=self._display_path_thread, args=(path, dt), daemon=True
+        ).start()
+        pass
 
     def _display_path_thread(self, path: core.bindings.Path, dt):
         t = 0.0
